@@ -69,8 +69,26 @@ type ErrPostNotFound struct {
 }
 
 func NewRepository() *Repository {
+	posts := make(map[int]Post, 2)
+	posts[1] = Post{
+		ID:        1,
+		Author:    "Alice",
+		Content:   "Hello, world!",
+		CreatedAt: time.Now(),
+		Views:     0,
+		Reactions: map[string]int{},
+	}
+	posts[2] = Post{
+		ID:        2,
+		Author:    "Bob",
+		Content:   "This is a test post.",
+		CreatedAt: time.Now(),
+		Views:     0,
+		Reactions: map[string]int{},
+	}
+
 	return &Repository{
-		posts: make(map[int]Post),
+		posts: posts,
 	}
 }
 
