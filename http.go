@@ -6,15 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/baerla/go-sse-htmx/views"
-	"github.com/labstack/echo/v4"
 	"net/http"
 	"strconv"
-	"sync/atomic"
-	"time"
 
 	watermillhttp "github.com/ThreeDotsLabs/watermill-http/v2/pkg/http"
 	"github.com/ThreeDotsLabs/watermill/components/cqrs"
 	"github.com/ThreeDotsLabs/watermill/message"
+	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 )
 
@@ -37,11 +35,7 @@ func NewHandler(repo *Repository, eventBus *cqrs.EventBus, sseRouter watermillht
 	e.Use(middleware.Recover())
 	e.Use(middleware.Logger())
 
-	counter := sseHandlersCounter{}
-
-	e.GET("/", h.Index)
-	e.GET("/posts", h.Posts)
-	e.GET("/idle", h.Idle)
+	e.GET("/", h.AllPosts)
 	e.POST("/posts/:id/reactions", h.AddReaction)
 	e.GET("/posts/:id/stats", func(c echo.Context) error {
 		postID := c.Param("id")
@@ -49,44 +43,15 @@ func NewHandler(repo *Repository, eventBus *cqrs.EventBus, sseRouter watermillht
 
 		statsHandler(c.Response(), c.Request())
 		return nil
-	}, counter.Middleware)
-
-	go func() {
-		for {
-			fmt.Println("SSE handlers count:", counter.Count.Load())
-			time.Sleep(60 * time.Second)
-		}
-	}()
+	})
 
 	return e
 }
 
-func (h Handler) Index(c echo.Context) error {
-	posts, err := h.allPosts(c)
-	if err != nil {
-		return err
-	}
-
-	return views.Index(posts).Render(c.Request().Context(), c.Response())
-}
-
-func (h Handler) Posts(c echo.Context) error {
-	posts, err := h.allPosts(c)
-	if err != nil {
-		return err
-	}
-
-	return views.Posts(posts).Render(c.Request().Context(), c.Response())
-}
-
-func (h Handler) Idle(c echo.Context) error {
-	return views.Idle().Render(c.Request().Context(), c.Response())
-}
-
-func (h Handler) allPosts(c echo.Context) ([]views.Post, error) {
+func (h Handler) AllPosts(c echo.Context) error {
 	posts, err := h.repo.AllPosts(c.Request().Context())
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	for _, post := range posts {
@@ -96,7 +61,7 @@ func (h Handler) allPosts(c echo.Context) ([]views.Post, error) {
 
 		err = h.eventBus.Publish(c.Request().Context(), event)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
@@ -105,7 +70,7 @@ func (h Handler) allPosts(c echo.Context) ([]views.Post, error) {
 		postViews = append(postViews, newPostView(post))
 	}
 
-	return postViews, nil
+	return views.Index(postViews).Render(c.Request().Context(), c.Response())
 }
 
 func (h Handler) AddReaction(c echo.Context) error {
@@ -156,20 +121,7 @@ func (s *statsStream) InitialStreamResponse(w http.ResponseWriter, r *http.Reque
 		return nil, false
 	}
 
-	post, err := s.repo.PostByID(r.Context(), postID)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("could not get post"))
-		return nil, false
-	}
-
-	stats := PostStats{
-		ID:        post.ID,
-		Views:     post.Views,
-		Reactions: post.Reactions,
-	}
-
-	resp, err := newPostStatsView(r.Context(), stats)
+	resp, err := s.getResponse(r.Context(), postID, nil)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(err.Error()))
@@ -198,15 +150,7 @@ func (s *statsStream) NextStreamResponse(r *http.Request, msg *message.Message) 
 		return "", false
 	}
 
-	stats := PostStats{
-		ID:              event.PostID,
-		Views:           event.Views,
-		ViewsUpdated:    event.ViewsUpdated,
-		Reactions:       event.Reactions,
-		ReactionUpdated: event.ReactionUpdated,
-	}
-
-	resp, err := newPostStatsView(r.Context(), stats)
+	resp, err := s.getResponse(r.Context(), postID, &event)
 	if err != nil {
 		fmt.Println("could not get response: " + err.Error())
 		return nil, false
@@ -215,29 +159,34 @@ func (s *statsStream) NextStreamResponse(r *http.Request, msg *message.Message) 
 	return resp, true
 }
 
-func newPostStatsView(ctx context.Context, stats PostStats) (interface{}, error) {
+func (s *statsStream) getResponse(ctx context.Context, postID int, event *PostStatsUpdated) (interface{}, error) {
+	post, err := s.repo.PostByID(ctx, postID)
+	if err != nil {
+		return nil, err
+	}
+
 	var reactions []views.Reaction
 
 	for _, r := range allReactions {
 		reactions = append(reactions, views.Reaction{
 			ID:          r.ID,
 			Label:       r.Label,
-			Count:       fmt.Sprint(stats.Reactions[r.ID]),
-			JustChanged: stats.ReactionUpdated != nil && *stats.ReactionUpdated == r.ID,
+			Count:       fmt.Sprint(post.Reactions[r.ID]),
+			JustChanged: event != nil && event.ReactionUpdated != nil && *event.ReactionUpdated == r.ID,
 		})
 	}
 
-	view := views.PostStats{
-		PostID: fmt.Sprint(stats.ID),
+	stats := views.PostStats{
+		PostID: fmt.Sprint(post.ID),
 		Views: views.PostViews{
-			Count:       fmt.Sprint(stats.Views),
-			JustChanged: stats.ViewsUpdated,
+			Count:       fmt.Sprint(post.Views),
+			JustChanged: event != nil && event.ViewsUpdated,
 		},
 		Reactions: reactions,
 	}
 
 	var buffer bytes.Buffer
-	err := views.PostStatsView(view).Render(ctx, &buffer)
+	err = views.PostStatsView(stats).Render(ctx, &buffer)
 	if err != nil {
 		return nil, err
 	}
@@ -251,17 +200,5 @@ func newPostView(p Post) views.Post {
 		Content: p.Content,
 		Author:  p.Author,
 		Date:    p.CreatedAt.Format("02 Jan 2006 15:04"),
-	}
-}
-
-type sseHandlersCounter struct {
-	Count atomic.Int64
-}
-
-func (s *sseHandlersCounter) Middleware(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) error {
-		s.Count.Add(1)
-		defer s.Count.Add(-1)
-		return next(c)
 	}
 }
