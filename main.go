@@ -137,4 +137,11 @@ func main() {
 			panic(err)
 		}
 	}()
+
+	handler := NewHandler(repo, eventBus, sseRouter)
+
+	err = handler.Start(":8080")
+	if err != nil {
+		panic(err)
+	}
 }
